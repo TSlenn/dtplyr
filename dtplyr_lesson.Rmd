@@ -138,10 +138,66 @@ summary(dt_bench) %>% select(-expr)
 tibble(method = c("dplyr", "dtplyr"), mean = c(summary(dplyr_bench)$mean, summary(dt_bench)$mean))
 ```
 
+Benchmark summary outputs are in milliseconds. dtplyr was nearly 4 times faster than dplyr
 
+
+## Weaknesses
+
+dtplyr still has some weaknesses.  The major mechanic that makes it work is that it nests all of the dplyr pipes, and efficiently runs them all at the same time via the data.table package. In a for loop or map function, R will still need to process each computation independently, negating the efficiency of dtplyr.
+
+## Parallel Processing
+
+In that case, we can still speed up the process using parallel processing. There is one step left in transforming the data. For each nested dataframe (or list in dtplyr), we need to filter out anything that happened after the "current" date. We can do this in dplyr with a map function:
 
 
 ```{r}
-%>% 
-    mutate(history = map2(history, Start, function(hist, date){filter(as.data.table(hist), V2 < date)}))
+map_time <- microbenchmark({df_dplyr %>% 
+  mutate(history = map2(history, Start, function(hist, date){filter(hist, Start < date)})) 
+    ## Maps filter to history to remove "future" data based on meet date
+}, times = 5)
+
+summary(map_time) %>% select(-expr)
 ```
+
+Or with a for loop (using foreach instead of standard for):
+
+```{r parallel}
+library(doParallel)
+```
+
+```{r foreach}
+for_time <- microbenchmark({
+  history <- df_dtplyr$history
+  foreach(i = 1:length(history)) %do% {
+    index <- df_dtplyr$history[[i]][[2]] < df_dtplyr$Start[i] ## T/F of each date less than current
+    history[[i]][[1]] <- df_dtplyr$history[[i]][[1]][index]  ## Overwrite Times with filtered by index
+    history[[i]][[2]] <- df_dtplyr$history[[i]][[2]][index]  ## Overwrite dates with filtered by index
+    } 
+}, times = 5)
+
+summary(for_time) %>% select(-expr)
+#history[[50]]
+```
+
+
+```{r forparallel}
+registerDoParallel(cores = detectCores()-1) ## set number of cores for parallel processing
+history <- df_dtplyr$history
+par_time <- microbenchmark({
+  foreach(i = 1:length(history)) %dopar% {
+    index <- df_dtplyr$history[[i]][[2]] < df_dtplyr$Start[i] ## T/F of each date less than current
+    history[[i]][[1]] <- df_dtplyr$history[[i]][[1]][index]  ## Overwrite Times with filtered by index
+    history[[i]][[2]] <- df_dtplyr$history[[i]][[2]][index]  ## Overwrite dates with filtered by index
+    } 
+}, times = 5)
+
+summary(par_time) %>% select(-expr)
+#history[[50]]
+
+```
+
+
+On my laptop, this barely performs better than the regular loop, and performs worse than the map2() function from purrr. Without using parallel processing, my laptop is typically around 70% cpu usage when running a code chunk. By using additional clusters, I only gain about 30% speed, and lose efficiency because the cores have to communicate.  
+
+However, my home pc has 6 cores, more RAM, and more processing power. When running a code chunk, my pc is typically around 20% cpu usage. Parallel processing can gain up to 80% computing power, and computing time shows significant improvement.
+
