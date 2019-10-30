@@ -1,0 +1,147 @@
+---
+title: "dtplyr_lesson"
+author: "Terry Slenn"
+date: "October 29, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r packages}
+suppressPackageStartupMessages({
+  require(tidyverse)
+  require(data.table)
+  require(dtplyr)  ## devtools::install_github("tidyverse/dtplyr") May need the devtools version.  Still in development
+  require(purrr) ## Good mapping functions
+  require(microbenchmark)
+  })
+```
+
+The data for this example is taken from a high school swim team, with Athlete and School names removed.
+
+```{r load_data}
+load("dtdata.RData")
+head(Athlete)
+head(Meet)
+head(Results)
+```
+
+## Dplyr/tidyverse
+
+The tidyverse packages in R are one of the major reasons for Rs popularity.  It allows for easy to comment code that reads like a sentence. In the below code we will
+
+1. combine the three tables into a single dataframe
+2. Nest the results for each athlete and event
+3. Join the nested data back into the df
+4. Map a function to nested data to filter out dates after the current date
+
+The finished df from this code chunk added all previous results for each swimmer at each date, which then can be used to generate predictions.
+
+```{r dplyr}
+df_dplyr <- left_join(Results, Athlete, by = c("ATHLETE" = "Athlete")) %>% ## Add Sex from Athlete table to results
+  left_join(Meet, by = c("MEET" = "Meet")) ## Add Meet Date and Course (pool length) from Meet table
+
+df_dplyr <- df_dplyr %>% 
+  select(ATHLETE, EVENT, TIME, Start) %>% ## Only keep grouping vars and data to nest
+  nest(TIME, Start, .key = "history") %>% ## Time and meet date are nested as their own dfs inside the "history" column
+  right_join(df_dplyr) #%>% ## Join nested data back into full df
+  #mutate(history = map2(history, Start, function(hist, date){filter(hist, Start < date)})) Saving for later
+  ## Maps filter to history to remove "future" data based on meet date
+```
+
+A lot of dataframe operations were performed in that code chunk on a medium sized dataframe.  It is easy to follow thanks to dplyr functions and organized comments, but it takes a few seconds to run. With a much larger dataset, and more complicated calculations, dplyr stops being feasible.  Lets benchmark the performance. microbenchmark will run the previous chunk 100 times, and compute the average run time.  Even at only 100 times the calculations, it takes a few minutes.
+
+```{r dplyr_bench}
+dplyr_bench <- microbenchmark({
+  df_dplyr <- left_join(Results, Athlete, by = c("ATHLETE" = "Athlete")) %>% ## Add Sex from Athlete table to results
+    left_join(Meet, by = c("MEET" = "Meet")) ## Add Meet Date and Course (pool length) from Meet table
+
+  df_dplyr <- df_dplyr %>% 
+    select(ATHLETE, EVENT, TIME, Start) %>% ## Only keep grouping vars and data to nest
+    nest(TIME, Start, .key = "history") %>% ## Time and meet date are nested as their own dfs inside the "history" column
+    right_join(df_dplyr, by = c("ATHLETE", "EVENT")) #%>% ## Join nested data back into full df
+    #mutate(history = map2(history, Start, function(hist, date){filter(hist, Start < date)})) 
+    ## Maps filter to history to remove "future" data based on meet date
+})
+
+summary(dplyr_bench) %>% 
+  select(-expr)
+```
+
+## data.table
+
+Fortunately we have a solution! The data.table package offers a more efficient alternative than the tibbles favored by tidyr and dplyr. We can write much more efficient code, but we lose the intuitive understanding and easy commenting that we have with dplyr.
+
+*Note:* I don't actually know data.table yet. The below code is the "source output from dtplyr". It needs some adjustments to run as data.table.
+
+```{r data.table, eval = FALSE}
+`_DT6`[`_DT5`[`_DT4`, on = .(Athlete = ATHLETE)], .(Athlete, 
+    EVENT, TIME, Start), on = .(Meet = MEET)][, .(history = list(list(TIME, 
+    Start))), keyby = .(Athlete, EVENT)][`_DT6`[`_DT5`[`_DT4`, 
+    on = .(Athlete = ATHLETE)], on = .(Meet = MEET)], on = .(EVENT, 
+    Athlete)]
+
+```
+
+
+
+## dtplyr
+
+The dtplyr package was updated just this August as a viable alternative. It creates function wrappers to apply dplyr functions to data.tables. For more information on the update see this blog post from August 14th:
+
+https://www.r-bloggers.com/big-data-wrangling-4-6m-rows-with-dtplyr-the-new-data-table-backend-for-dplyr/
+
+
+
+```{r dtplyr_init}
+Results_dt <- lazy_dt(Results)
+Athlete_dt <- lazy_dt(Athlete)
+Meet_dt <- lazy_dt(Meet)
+```
+
+The core mechanic of dtplyr is the use of lazy_dt(). Any dplyr function applied to the result won't actually run code. It will generate efficient data.table code and provide a preview of the final output. The data wrangling is not actually done until you use as.data.table() on the final result.
+
+
+
+```{r dtplyr}
+df_dtplyr <- left_join(Results_dt, Athlete_dt, by = c("ATHLETE" = "Athlete")) %>% ## Add Sex from Athlete table to results
+    left_join(Meet_dt, by = c("MEET" = "Meet")) ## Add Meet Date and Course (pool length) from Meet table
+  
+df_dtplyr <- df_dtplyr %>% 
+    select(Athlete, EVENT, TIME, Start) %>% ## Only keep grouping vars and data to nest
+    group_by(Athlete, EVENT) %>% 
+    summarize(history = list(list(TIME, Start))) %>% 
+    ungroup() %>% 
+    right_join(df_dtplyr) %>% 
+    as.data.table()
+```
+
+
+```{r dt_bench}
+dt_bench <- microbenchmark({
+    df_dtplyr <- left_join(Results_dt, Athlete_dt, by = c("ATHLETE" = "Athlete")) %>% ## Add Sex from Athlete table to results
+        left_join(Meet_dt, by = c("MEET" = "Meet")) ## Add Meet Date and Course (pool length) from Meet table
+      
+    df_dtplyr <- df_dtplyr %>% 
+        select(Athlete, EVENT, TIME, Start) %>% ## Only keep grouping vars and data to nest
+        group_by(Athlete, EVENT) %>% 
+        summarize(history = list(list(TIME, Start))) %>% 
+        ungroup() %>% 
+        right_join(df_dtplyr) %>% 
+        as.data.table()
+})
+
+summary(dt_bench) %>% select(-expr)
+
+tibble(method = c("dplyr", "dtplyr"), mean = c(summary(dplyr_bench)$mean, summary(dt_bench)$mean))
+```
+
+
+
+
+```{r}
+%>% 
+    mutate(history = map2(history, Start, function(hist, date){filter(as.data.table(hist), V2 < date)}))
+```
